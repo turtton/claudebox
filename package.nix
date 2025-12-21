@@ -1,4 +1,8 @@
-{ pkgs }:
+{
+  pkgs,
+  # Keep this so package.nix can be copied into llm-agents.nix
+  sourceDir ? ./src,
+}:
 let
   inherit (pkgs.stdenv) isLinux isDarwin;
 
@@ -32,7 +36,7 @@ let
   sandboxTools = if isLinux then [ pkgs.bubblewrap ] else [ ];
 
   # Seatbelt profile for macOS (only installed on darwin)
-  seatbeltProfile = ./src/seatbelt.sbpl;
+  seatbeltProfile = "${sourceDir}/seatbelt.sbpl";
 in
 pkgs.runCommand "claudebox"
   {
@@ -49,13 +53,13 @@ pkgs.runCommand "claudebox"
     mkdir -p $out/bin $out/share/claudebox $out/libexec/claudebox
 
     # Install claudebox launcher script
-    cp ${./src/claudebox.js} $out/libexec/claudebox/claudebox.js
+    cp ${sourceDir}/claudebox.js $out/libexec/claudebox/claudebox.js
 
     # Install command-viewer script
-    cp ${./src/command-viewer.js} $out/libexec/claudebox/command-viewer.js
+    cp ${sourceDir}/command-viewer.js $out/libexec/claudebox/command-viewer.js
 
     # Install wrapper script
-    cp ${./src/command-viewer-wrapper.sh} $out/libexec/claudebox/command-viewer-wrapper.sh
+    cp ${sourceDir}/command-viewer-wrapper.sh $out/libexec/claudebox/command-viewer-wrapper.sh
     chmod +x $out/libexec/claudebox/command-viewer-wrapper.sh
 
     # Install seatbelt profile for macOS
@@ -87,6 +91,6 @@ pkgs.runCommand "claudebox"
 
     # Create claude wrapper that references the original
     makeWrapper ${pkgs.claude-code}/bin/claude $out/libexec/claudebox/claude \
-      --set NODE_OPTIONS "--require=${./src/command-logger.js}" \
+      --set NODE_OPTIONS "--require=${sourceDir}/command-logger.js" \
       --inherit-argv0
   ''
