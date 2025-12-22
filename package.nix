@@ -1,5 +1,7 @@
 {
   pkgs,
+  # Make claude-code overridable
+  claude-code,
   # Keep this so package.nix can be copied into llm-agents.nix
   sourceDir ? ./src,
 }:
@@ -90,7 +92,7 @@ pkgs.runCommand "claudebox"
       ${if isDarwin then "--set CLAUDEBOX_SEATBELT_PROFILE $out/share/claudebox/seatbelt.sbpl" else ""}
 
     # Create claude wrapper that references the original
-    makeWrapper ${pkgs.claude-code}/bin/claude $out/libexec/claudebox/claude \
+    makeWrapper ${claude-code}/bin/claude $out/libexec/claudebox/claude \
       --set NODE_OPTIONS "--require=${sourceDir}/command-logger.js" \
       --inherit-argv0
   ''
