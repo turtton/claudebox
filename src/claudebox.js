@@ -1,6 +1,5 @@
 #!/usr/bin/env node
-// claudebox - Run Claude Code in YOLO mode with transparency
-// Shows all commands Claude executes in a tmux split pane
+// claudebox - Run Claude Code in a sandbox
 
 const { execSync, spawn } = require("child_process");
 const fs = require("fs");
@@ -11,19 +10,6 @@ const process = require("process");
 // Utility Functions
 // =============================================================================
 
-function getTerminalSize() {
-	try {
-		const output = execSync("stty size 2>/dev/null", {
-			encoding: "utf8",
-			stdio: ["inherit", "pipe", "pipe"],
-		});
-		const [rows, cols] = output.trim().split(/\s+/).map(Number);
-		return { rows: rows || 24, cols: cols || 80 };
-	} catch {
-		return { rows: 24, cols: 80 };
-	}
-}
-
 function getRepoRoot(projectDir) {
 	try {
 		return execSync("git rev-parse --show-toplevel 2>/dev/null", {
@@ -33,10 +19,6 @@ function getRepoRoot(projectDir) {
 	} catch {
 		return projectDir;
 	}
-}
-
-function sanitizeSessionPrefix(name) {
-	return name.replace(/[./:]/g, "_");
 }
 
 function randomHex(length) {
@@ -61,14 +43,6 @@ function pathExists(p) {
 	}
 }
 
-function isFile(p) {
-	try {
-		return fs.statSync(p).isFile();
-	} catch {
-		return false;
-	}
-}
-
 function isDirectory(p) {
 	try {
 		return fs.statSync(p).isDirectory();
@@ -86,13 +60,9 @@ function getTmpDir() {
 // =============================================================================
 
 const CONFIG_DEFAULTS = {
-	monitor: true,
-	splitDirection: "auto",
-	loadTmuxConfig: true,
 	allowSshAgent: false,
 	allowGpgAgent: false,
 	allowXdgRuntime: false,
-	logFile: null,
 };
 
 function getConfigPath() {
@@ -181,11 +151,8 @@ class BubblewrapSandbox extends Sandbox {
 			claudeHome,
 			claudeConfig,
 			claudeJson,
-			sessionName,
 			shareTree,
 			repoRoot,
-			logfile,
-			loadTmuxConfig,
 			allowSshAgent,
 			allowGpgAgent,
 			allowXdgRuntime,
@@ -194,8 +161,6 @@ class BubblewrapSandbox extends Sandbox {
 		const home = process.env.HOME;
 		const user = process.env.USER;
 		const pathEnv = process.env.PATH;
-		const xdgConfigHome =
-			process.env.XDG_CONFIG_HOME || path.join(home, ".config");
 
 		const args = [
 			// Basic filesystem
@@ -280,12 +245,6 @@ class BubblewrapSandbox extends Sandbox {
 			"PATH",
 			pathEnv,
 			"--setenv",
-			"SESSION_NAME",
-			sessionName,
-			"--setenv",
-			"CLAUDEBOX_LOG_FILE",
-			logfile,
-			"--setenv",
 			"TMPDIR",
 			"/tmp",
 			"--setenv",
@@ -297,27 +256,7 @@ class BubblewrapSandbox extends Sandbox {
 			"--setenv",
 			"TMP",
 			"/tmp",
-			"--setenv",
-			"TMUX_TMPDIR",
-			"/tmp",
 		];
-
-		// Mount tmux configuration if requested
-		if (loadTmuxConfig) {
-			const tmuxConf = path.join(home, ".tmux.conf");
-			if (isFile(tmuxConf)) {
-				args.push("--ro-bind", tmuxConf, path.join(home, ".tmux.conf"));
-			}
-
-			const tmuxConfigDir = path.join(xdgConfigHome, "tmux");
-			if (isDirectory(tmuxConfigDir)) {
-				args.push(
-					"--ro-bind",
-					tmuxConfigDir,
-					path.join(home, ".config", "tmux"),
-				);
-			}
-		}
 
 		// Mount parent directory tree as read-only if needed
 		if (shareTree !== repoRoot) {
@@ -326,9 +265,6 @@ class BubblewrapSandbox extends Sandbox {
 
 		// Project directory gets full write access (YOLO mode)
 		args.push("--bind", repoRoot, repoRoot);
-
-		// Mount logfile
-		args.push("--bind", logfile, logfile);
 
 		// XDG runtime directory access (opt-in)
 		const xdgRuntimeDir =
@@ -375,7 +311,7 @@ class BubblewrapSandbox extends Sandbox {
 
 class SeatbeltSandbox extends Sandbox {
 	wrap(script) {
-		const { repoRoot, logfile, sessionName } = this.config;
+		const { repoRoot } = this.config;
 
 		// Load base policy from environment
 		const seatbeltProfile = process.env.CLAUDEBOX_SEATBELT_PROFILE;
@@ -397,7 +333,6 @@ class SeatbeltSandbox extends Sandbox {
 		const writablePaths = [
 			'(subpath (param "PROJECT_DIR"))',
 			'(subpath (param "TMPDIR"))',
-			'(subpath (param "LOGFILE_DIR"))',
 		];
 
 		if (canonicalTmpdir !== canonicalSlashTmp) {
@@ -426,7 +361,6 @@ class SeatbeltSandbox extends Sandbox {
 			fullPolicy,
 			`-DPROJECT_DIR=${canonicalRepoRoot}`,
 			`-DTMPDIR=${canonicalTmpdir}`,
-			`-DLOGFILE_DIR=${path.dirname(logfile)}`,
 		];
 
 		if (canonicalTmpdir !== canonicalSlashTmp) {
@@ -435,17 +369,10 @@ class SeatbeltSandbox extends Sandbox {
 
 		args.push("--", "bash", "-c", script);
 
-		// Environment variables (sandbox-exec inherits env, unlike bwrap)
-		const env = {
-			...process.env,
-			SESSION_NAME: sessionName,
-			CLAUDEBOX_LOG_FILE: logfile,
-		};
-
 		return {
 			cmd: "/usr/bin/sandbox-exec",
 			args,
-			env,
+			env: process.env,
 		};
 	}
 }
@@ -454,23 +381,12 @@ class SeatbeltSandbox extends Sandbox {
 // CLI Argument Parsing
 // =============================================================================
 
-function resolveSplitDirection(direction) {
-	if (direction === "auto") {
-		const { rows, cols } = getTerminalSize();
-		return cols >= rows * 3 ? "horizontal" : "vertical";
-	}
-	return direction;
-}
-
 function parseArgs(args) {
 	// Load config file first
 	const config = loadConfig();
 
 	// CLI overrides - undefined means "not specified"
 	const cliOverrides = {
-		enableMonitor: undefined,
-		splitDirection: undefined,
-		loadTmuxConfig: undefined,
 		allowSshAgent: undefined,
 		allowGpgAgent: undefined,
 		allowXdgRuntime: undefined,
@@ -481,35 +397,6 @@ function parseArgs(args) {
 		const arg = args[i];
 
 		switch (arg) {
-			case "--no-monitor":
-				cliOverrides.enableMonitor = false;
-				i++;
-				break;
-
-			case "--split-direction":
-				if (i + 1 >= args.length) {
-					console.error("Error: --split-direction requires a value");
-					process.exit(1);
-				}
-				cliOverrides.splitDirection = args[i + 1];
-				if (
-					!["horizontal", "vertical", "auto"].includes(
-						cliOverrides.splitDirection,
-					)
-				) {
-					console.error(
-						"Error: --split-direction must be 'horizontal', 'vertical', or 'auto'",
-					);
-					process.exit(1);
-				}
-				i += 2;
-				break;
-
-			case "--no-tmux-config":
-				cliOverrides.loadTmuxConfig = false;
-				i++;
-				break;
-
 			case "--allow-ssh-agent":
 				cliOverrides.allowSshAgent = true;
 				i++;
@@ -540,19 +427,6 @@ function parseArgs(args) {
 
 	// Merge: CLI overrides > config file > defaults
 	const options = {
-		enableMonitor:
-			cliOverrides.enableMonitor !== undefined
-				? cliOverrides.enableMonitor
-				: config.monitor,
-		splitDirection: resolveSplitDirection(
-			cliOverrides.splitDirection !== undefined
-				? cliOverrides.splitDirection
-				: config.splitDirection,
-		),
-		loadTmuxConfig:
-			cliOverrides.loadTmuxConfig !== undefined
-				? cliOverrides.loadTmuxConfig
-				: config.loadTmuxConfig,
 		allowSshAgent:
 			cliOverrides.allowSshAgent !== undefined
 				? cliOverrides.allowSshAgent
@@ -565,8 +439,6 @@ function parseArgs(args) {
 			cliOverrides.allowXdgRuntime !== undefined
 				? cliOverrides.allowXdgRuntime
 				: config.allowXdgRuntime,
-		// This comes only from config file
-		logFile: config.logFile,
 	};
 
 	return options;
@@ -577,10 +449,6 @@ function showHelp() {
 	console.log(`Usage: claudebox [OPTIONS]
 
 Options:
-  --no-monitor                            Skip tmux monitoring pane (run Claude directly)
-  --split-direction horizontal|vertical|auto
-                                          Set tmux split direction (default: auto)
-  --no-tmux-config                        Don't load user tmux configuration
   --allow-ssh-agent                       Allow access to SSH agent socket
   --allow-gpg-agent                       Allow access to GPG agent socket
   --allow-xdg-runtime                     Allow full XDG runtime directory access
@@ -592,10 +460,9 @@ Configuration:
 
   Example config:
     {
-      "monitor": true,
-      "splitDirection": "auto",
       "allowSshAgent": false,
-      "logFile": "/tmp/my-claude.log"
+      "allowGpgAgent": false,
+      "allowXdgRuntime": false
     }
 
 Security:
@@ -605,7 +472,6 @@ Security:
 
 Examples:
   claudebox                               # Run with default settings
-  claudebox --no-monitor                  # Run without monitoring pane
   claudebox --allow-ssh-agent             # Allow SSH agent for git operations
   claudebox --allow-xdg-runtime           # Allow full XDG runtime access`);
 }
@@ -618,25 +484,14 @@ function main() {
 	const args = process.argv.slice(2);
 	const options = parseArgs(args);
 
-	// Prevent running monitoring mode inside tmux
-	if (options.enableMonitor && process.env.TMUX) {
-		console.error(
-			"Error: claudebox monitoring mode cannot be run inside a tmux session.",
-		);
-		console.error("       Use 'claudebox --no-monitor' to run inside tmux.");
-		process.exit(1);
-	}
-
 	// Session setup
 	const projectDir = process.cwd();
 	const repoRoot = getRepoRoot(projectDir);
-	const sessionPrefix = sanitizeSessionPrefix(path.basename(repoRoot));
 	const sessionId = randomHex(8);
-	const sessionName = `${sessionPrefix}-${sessionId}`;
 
 	// Create isolated home directory
 	const home = process.env.HOME;
-	const claudeHome = path.join(getTmpDir(), sessionName);
+	const claudeHome = path.join(getTmpDir(), `claudebox-${sessionId}`);
 
 	// Cleanup handler
 	const cleanup = () => {
@@ -664,9 +519,6 @@ function main() {
 	fs.mkdirSync(claudeConfig, { recursive: true });
 	const claudeJson = path.join(home, ".claude.json");
 
-	// Prepare tmux config directory in isolated home
-	fs.mkdirSync(path.join(claudeHome, ".config", "tmux"), { recursive: true });
-
 	// Initialize Claude if needed
 	if (!pathExists(claudeJson)) {
 		console.log("Initializing Claude configuration...");
@@ -690,14 +542,6 @@ function main() {
 		shareTree = realRepoRoot;
 	}
 
-	// Log file setup (use config value or generate default)
-	const logfile =
-		options.logFile ||
-		path.join(getTmpDir(), `claudebox-commands-${sessionName}.log`);
-	// Ensure log file directory exists and create the file
-	fs.mkdirSync(path.dirname(logfile), { recursive: true });
-	fs.writeFileSync(logfile, "");
-
 	// Create sandbox
 	let sandbox;
 	try {
@@ -705,11 +549,8 @@ function main() {
 			claudeHome,
 			claudeConfig,
 			claudeJson,
-			sessionName,
 			shareTree,
 			repoRoot,
-			logfile,
-			loadTmuxConfig: options.loadTmuxConfig,
 			allowSshAgent: options.allowSshAgent,
 			allowGpgAgent: options.allowGpgAgent,
 			allowXdgRuntime: options.allowXdgRuntime,
@@ -720,20 +561,8 @@ function main() {
 	}
 
 	// Build script and launch
-	const splitFlag = options.splitDirection === "vertical" ? "-v" : "-h";
-
-	const script = options.enableMonitor
-		? `
+	const script = `
 cd '${projectDir}'
-tmux new-session -d -s '${sessionName}' -n main 'claude --dangerously-skip-permissions' 2>/dev/null
-tmux set-option -t '${sessionName}' history-limit 50000
-tmux split-window -d ${splitFlag} -t '${sessionName}:main' "exec command-viewer '${logfile}'"
-exec tmux attach -t '${sessionName}'
-`
-		: `
-cd '${projectDir}'
-echo 'claudebox: Commands logged to ${logfile}' >&2
-echo 'claudebox: Use tail -f ${logfile} to monitor in another terminal' >&2
 exec claude --dangerously-skip-permissions
 `;
 

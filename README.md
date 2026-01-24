@@ -9,8 +9,6 @@ The project shadows your $HOME, so no credentials are accessible (except
 The project parent folder is mounted read-only so it's possible to access
 other dependencies.
 
-We also patch Claude to monitor all the executed commands in a tmux split pane.
-
 ## Recommended usage
 
 This project is best used with [numtide/llm-agents.nix](https://github.com/numtide/llm-agents.nix) to get fresh Claude Code versions (among others).
@@ -39,9 +37,6 @@ claudebox [OPTIONS]
 
 ### Options
 
-- `--no-monitor` - Skip tmux monitoring pane (run Claude directly in current terminal)
-- `--split-direction horizontal|vertical|auto` - Set tmux split direction (default: `auto`)
-- `--no-tmux-config` - Don't load user tmux configuration (use default tmux settings)
 - `--allow-ssh-agent` - Allow access to SSH agent socket (for git operations)
 - `--allow-gpg-agent` - Allow access to GPG agent socket (for signing)
 - `--allow-xdg-runtime` - Allow full XDG runtime directory access
@@ -50,34 +45,12 @@ claudebox [OPTIONS]
 ### Examples
 
 ```bash
-# Default: run with users tmux config and enable monitoring
+# Run with default settings
 claudebox
 
-# Vertical split
-claudebox --split-direction vertical
-
-# Use default tmux settings (ignore user config)
-claudebox --no-tmux-config
-
-# Run without monitoring pane, this can run outside of tmux
-claudebox --no-monitor
+# Allow SSH agent for git operations
+claudebox --allow-ssh-agent
 ```
-
-### Layout
-
-Opens Claude Code with:
-
-- Left pane (horizontal) / Top pane (vertical): Claude interface
-- Right pane (horizontal) / Bottom pane (vertical): Live command log
-
-When the layout is not explicitly set, the application adapts to the terminal dimensions.
-For very wide terminals, the interface splits vertically: Claude on the left, live command log on the right.
-For narrower terminals, the layout adjusts accordingly (stacked panes).
-
-### Behavior
-
-- **Default**: Opens tmux with two panels, once for Claude interface and one for live command log.
-- **With `--no-monitor`**: Runs Claude directly, without `tmux`
 
 ## Configuration
 
@@ -88,13 +61,9 @@ CLI arguments override config file settings.
 
 ```json
 {
-  "monitor": true,
-  "splitDirection": "auto",
-  "loadTmuxConfig": true,
   "allowSshAgent": false,
   "allowGpgAgent": false,
-  "allowXdgRuntime": false,
-  "logFile": null
+  "allowXdgRuntime": false
 }
 ```
 
@@ -102,22 +71,13 @@ CLI arguments override config file settings.
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `monitor` | boolean | `true` | Enable tmux monitoring pane |
-| `splitDirection` | string | `"auto"` | `"horizontal"`, `"vertical"`, or `"auto"` |
-| `loadTmuxConfig` | boolean | `true` | Load user's tmux configuration |
 | `allowSshAgent` | boolean | `false` | Mount SSH agent socket |
 | `allowGpgAgent` | boolean | `false` | Mount GPG agent socket |
 | `allowXdgRuntime` | boolean | `false` | Mount full XDG runtime dir |
-| `logFile` | string/null | `null` | Custom log file path (null = auto in /tmp) |
 
 ## What it does
 
 - Lightweight sandbox using bubblewrap (Linux) or sandbox-exec (macOS)
-- Intercepts all commands via Node.js instrumentation
-- Shows commands in real-time in tmux
-- Supports custom split direction (horizontal/vertical)
-- Loads user tmux configuration by default (can be disabled with `--no-tmux-config`)
-- Displays commands in real time in tmux and stores them in a log file under `/tmp`.
 - Disables telemetry and auto-updates
 - Uses `--dangerously-skip-permissions` (safe in sandbox)
 
