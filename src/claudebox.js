@@ -55,6 +55,59 @@ function getTmpDir() {
 	return process.env.TMPDIR || process.env.TEMP || process.env.TMP || "/tmp";
 }
 
+/**
+ * Read IDE auth token from lock files in ~/.claude/ide/.
+ * IDE extensions (VS Code, Neovim, etc.) write lock files containing
+ * port, PID, auth token, and other connection info.
+ * @returns {string|null} The auth token, or null if not found
+ */
+function readIdeAuthToken() {
+	const home = process.env.HOME;
+	const ideDir = path.join(home, ".claude", "ide");
+	if (!isDirectory(ideDir)) return null;
+
+	// Try CLAUDE_CODE_SSE_PORT-specific lock file first
+	// Lock files are named <port>.lock or <port> (e.g., "33140.lock")
+	const ssePort = process.env.CLAUDE_CODE_SSE_PORT;
+	if (ssePort && /^\d+$/.test(ssePort)) {
+		for (const name of [`${ssePort}.lock`, ssePort]) {
+			const lockFile = path.join(ideDir, name);
+			if (pathExists(lockFile)) {
+				try {
+					const content = JSON.parse(fs.readFileSync(lockFile, "utf8"));
+					if (content.authToken) return content.authToken;
+				} catch {
+					// Ignore parse errors
+				}
+			}
+		}
+	}
+
+	// Fall back to any lock file in the directory (prefer newest)
+	try {
+		const files = fs.readdirSync(ideDir)
+			.filter((f) => /^\d+(\.lock)?$/.test(f))
+			.map((f) => ({
+				name: f,
+				mtime: fs.statSync(path.join(ideDir, f)).mtimeMs,
+			}))
+			.sort((a, b) => b.mtime - a.mtime);
+		for (const { name } of files) {
+			const filePath = path.join(ideDir, name);
+			try {
+				const content = JSON.parse(fs.readFileSync(filePath, "utf8"));
+				if (content.authToken) return content.authToken;
+			} catch {
+				continue;
+			}
+		}
+	} catch {
+		// Ignore directory read errors
+	}
+
+	return null;
+}
+
 // =============================================================================
 // Configuration
 // =============================================================================
@@ -64,6 +117,7 @@ const CONFIG_DEFAULTS = {
 	allowGpgAgent: false,
 	allowGitConfig: false,
 	allowXdgRuntime: false,
+	allowIde: false,
 };
 
 function getConfigPath() {
@@ -158,6 +212,7 @@ class BubblewrapSandbox extends Sandbox {
 			allowGpgAgent,
 			allowGitConfig,
 			allowXdgRuntime,
+			allowIde,
 		} = this.config;
 
 		const home = process.env.HOME;
@@ -318,6 +373,17 @@ class BubblewrapSandbox extends Sandbox {
 			}
 		}
 
+		// IDE integration (opt-in)
+		// PID namespace isolation causes Claude Code to consider IDE lock files
+		// as stale (host PIDs are invisible). Mount the IDE directory as read-only
+		// to prevent lock file deletion, and pass the auth token via the launch script.
+		if (allowIde) {
+			const ideDir = path.join(home, ".claude", "ide");
+			if (isDirectory(ideDir)) {
+				args.push("--ro-bind", ideDir, path.join(home, ".claude", "ide"));
+			}
+		}
+
 		// Add the script to execute
 		args.push("bash", "-c", script);
 
@@ -415,6 +481,7 @@ function parseArgs(args) {
 		allowGpgAgent: undefined,
 		allowGitConfig: undefined,
 		allowXdgRuntime: undefined,
+		allowIde: undefined,
 	};
 
 	let i = 0;
@@ -439,6 +506,11 @@ function parseArgs(args) {
 
 			case "--allow-xdg-runtime":
 				cliOverrides.allowXdgRuntime = true;
+				i++;
+				break;
+
+			case "--allow-ide":
+				cliOverrides.allowIde = true;
 				i++;
 				break;
 
@@ -473,6 +545,10 @@ function parseArgs(args) {
 			cliOverrides.allowXdgRuntime !== undefined
 				? cliOverrides.allowXdgRuntime
 				: config.allowXdgRuntime,
+		allowIde:
+			cliOverrides.allowIde !== undefined
+				? cliOverrides.allowIde
+				: config.allowIde,
 	};
 
 	return options;
@@ -487,6 +563,7 @@ Options:
   --allow-gpg-agent                       Allow access to GPG agent socket
   --allow-git-config                      Allow access to user git configuration (read-only)
   --allow-xdg-runtime                     Allow full XDG runtime directory access
+  --allow-ide                             Allow IDE integration (auth token passthrough)
   -h, --help                              Show this help message
 
 Configuration:
@@ -498,7 +575,8 @@ Configuration:
       "allowSshAgent": false,
       "allowGpgAgent": false,
       "allowGitConfig": false,
-      "allowXdgRuntime": false
+      "allowXdgRuntime": false,
+      "allowIde": false
     }
 
 Security:
@@ -510,7 +588,9 @@ Examples:
   claudebox                               # Run with default settings
   claudebox --allow-ssh-agent             # Allow SSH agent for git operations
   claudebox --allow-git-config            # Allow user git config for commits
-  claudebox --allow-xdg-runtime           # Allow full XDG runtime access`);
+  claudebox --allow-xdg-runtime           # Allow full XDG runtime access
+  claudebox --allow-ide                  # Allow IDE extension integration`);
+
 }
 
 // =============================================================================
@@ -600,17 +680,46 @@ function main() {
 			allowGpgAgent: options.allowGpgAgent,
 			allowGitConfig: options.allowGitConfig,
 			allowXdgRuntime: options.allowXdgRuntime,
+			allowIde: options.allowIde,
 		});
 	} catch (err) {
 		console.error(`Error: ${err.message}`);
 		process.exit(1);
 	}
 
+	// IDE auth token passthrough
+	// Read the auth token from the IDE lock file before sandbox launch,
+	// then pass it via file descriptor inside the sandbox. This bypasses
+	// PID namespace issues where Claude Code would consider lock files stale.
+	let ideAuthToken = null;
+	if (options.allowIde) {
+		ideAuthToken = readIdeAuthToken();
+		if (ideAuthToken) {
+			const authFile = path.join(claudeHome, ".ide-auth-token");
+			fs.writeFileSync(authFile, ideAuthToken, { mode: 0o600 });
+		} else {
+			console.error(
+				"claudebox: --allow-ide specified but no IDE auth token found in ~/.claude/ide/",
+			);
+		}
+	}
+
 	// Build script and launch
-	const script = `
+	let script;
+	if (ideAuthToken) {
+		script = `
+exec 3< '${home}/.ide-auth-token'
+rm -f '${home}/.ide-auth-token'
+export CLAUDE_CODE_WEBSOCKET_AUTH_FILE_DESCRIPTOR=3
 cd '${projectDir}'
 exec claude --dangerously-skip-permissions
 `;
+	} else {
+		script = `
+cd '${projectDir}'
+exec claude --dangerously-skip-permissions
+`;
+	}
 
 	const child = sandbox.spawn(script);
 	child.on("close", (code) => process.exit(code || 0));
