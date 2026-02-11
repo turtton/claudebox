@@ -118,6 +118,7 @@ const CONFIG_DEFAULTS = {
 	allowGitConfig: false,
 	allowXdgRuntime: false,
 	allowIde: false,
+	allowChrome: false,
 };
 
 function getConfigPath() {
@@ -213,6 +214,7 @@ class BubblewrapSandbox extends Sandbox {
 			allowGitConfig,
 			allowXdgRuntime,
 			allowIde,
+			allowChrome,
 		} = this.config;
 
 		const home = process.env.HOME;
@@ -384,6 +386,49 @@ class BubblewrapSandbox extends Sandbox {
 			}
 		}
 
+		// Chrome browser integration (opt-in)
+		if (allowChrome) {
+			// Share the browser bridge socket directory so the native messaging
+			// host (running on host) and chrome-mcp (running in sandbox) can communicate
+			// via Unix socket at /tmp/claude-mcp-browser-bridge-$USER/<PID>.sock
+			const bridgeDir = path.join("/tmp", `claude-mcp-browser-bridge-${user}`);
+			fs.mkdirSync(bridgeDir, { recursive: true });
+			args.push("--bind", bridgeDir, bridgeDir);
+
+			// Bind-mount NativeMessagingHosts directories for all Chromium-based browsers.
+			// Creates directories on host if needed so the config persists across sessions.
+			const browserConfigDirs = [
+				"google-chrome",
+				"chromium",
+				"BraveSoftware",
+				"microsoft-edge",
+				"vivaldi",
+				"opera",
+			];
+			for (const browser of browserConfigDirs) {
+				// Check if the browser config root exists on host
+				// (only set up NativeMessagingHosts for browsers actually installed)
+				const browserConfigRoot = path.join(home, ".config", browser);
+				if (!isDirectory(browserConfigRoot)) continue;
+
+				const hostDir = path.join(
+					browserConfigRoot,
+					"NativeMessagingHosts",
+				);
+				// Create on host if it doesn't exist yet (persists across sessions)
+				fs.mkdirSync(hostDir, { recursive: true });
+				// Create mount point in temp home
+				const mountPoint = path.join(
+					claudeHome,
+					".config",
+					browser,
+					"NativeMessagingHosts",
+				);
+				fs.mkdirSync(mountPoint, { recursive: true });
+				args.push("--bind", hostDir, hostDir);
+			}
+		}
+
 		// Add the script to execute
 		args.push("bash", "-c", script);
 
@@ -482,6 +527,7 @@ function parseArgs(args) {
 		allowGitConfig: undefined,
 		allowXdgRuntime: undefined,
 		allowIde: undefined,
+		allowChrome: undefined,
 	};
 
 	let i = 0;
@@ -511,6 +557,11 @@ function parseArgs(args) {
 
 			case "--allow-ide":
 				cliOverrides.allowIde = true;
+				i++;
+				break;
+
+			case "--allow-chrome":
+				cliOverrides.allowChrome = true;
 				i++;
 				break;
 
@@ -549,6 +600,10 @@ function parseArgs(args) {
 			cliOverrides.allowIde !== undefined
 				? cliOverrides.allowIde
 				: config.allowIde,
+		allowChrome:
+			cliOverrides.allowChrome !== undefined
+				? cliOverrides.allowChrome
+				: config.allowChrome,
 	};
 
 	return options;
@@ -564,6 +619,7 @@ Options:
   --allow-git-config                      Allow access to user git configuration (read-only)
   --allow-xdg-runtime                     Allow full XDG runtime directory access
   --allow-ide                             Allow IDE integration (auth token passthrough)
+  --allow-chrome                          Allow Chrome browser extension integration
   -h, --help                              Show this help message
 
 Configuration:
@@ -576,7 +632,8 @@ Configuration:
       "allowGpgAgent": false,
       "allowGitConfig": false,
       "allowXdgRuntime": false,
-      "allowIde": false
+      "allowIde": false,
+      "allowChrome": false
     }
 
 Security:
@@ -589,7 +646,8 @@ Examples:
   claudebox --allow-ssh-agent             # Allow SSH agent for git operations
   claudebox --allow-git-config            # Allow user git config for commits
   claudebox --allow-xdg-runtime           # Allow full XDG runtime access
-  claudebox --allow-ide                  # Allow IDE extension integration`);
+  claudebox --allow-ide                  # Allow IDE extension integration
+  claudebox --allow-chrome                # Allow Chrome extension integration`);
 
 }
 
@@ -681,6 +739,7 @@ function main() {
 			allowGitConfig: options.allowGitConfig,
 			allowXdgRuntime: options.allowXdgRuntime,
 			allowIde: options.allowIde,
+			allowChrome: options.allowChrome,
 		});
 	} catch (err) {
 		console.error(`Error: ${err.message}`);
