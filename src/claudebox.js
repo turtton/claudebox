@@ -62,6 +62,7 @@ function getTmpDir() {
 const CONFIG_DEFAULTS = {
 	allowSshAgent: false,
 	allowGpgAgent: false,
+	allowGitConfig: false,
 	allowXdgRuntime: false,
 };
 
@@ -155,6 +156,7 @@ class BubblewrapSandbox extends Sandbox {
 			repoRoot,
 			allowSshAgent,
 			allowGpgAgent,
+			allowGitConfig,
 			allowXdgRuntime,
 		} = this.config;
 
@@ -229,6 +231,28 @@ class BubblewrapSandbox extends Sandbox {
 			"--bind",
 			claudeJson,
 			path.join(home, ".claude.json"),
+
+			// Git configuration (read-only, opt-in)
+			...(allowGitConfig
+				? [
+						// ~/.gitconfig
+						...(pathExists(path.join(home, ".gitconfig"))
+							? [
+									"--ro-bind",
+									path.join(home, ".gitconfig"),
+									path.join(home, ".gitconfig"),
+								]
+							: []),
+						// ~/.config/git/
+						...(isDirectory(path.join(home, ".config", "git"))
+							? [
+									"--ro-bind",
+									path.join(home, ".config", "git"),
+									path.join(home, ".config", "git"),
+								]
+							: []),
+					]
+				: []),
 
 			// Namespace isolation with network sharing
 			"--unshare-all",
@@ -389,6 +413,7 @@ function parseArgs(args) {
 	const cliOverrides = {
 		allowSshAgent: undefined,
 		allowGpgAgent: undefined,
+		allowGitConfig: undefined,
 		allowXdgRuntime: undefined,
 	};
 
@@ -404,6 +429,11 @@ function parseArgs(args) {
 
 			case "--allow-gpg-agent":
 				cliOverrides.allowGpgAgent = true;
+				i++;
+				break;
+
+			case "--allow-git-config":
+				cliOverrides.allowGitConfig = true;
 				i++;
 				break;
 
@@ -435,6 +465,10 @@ function parseArgs(args) {
 			cliOverrides.allowGpgAgent !== undefined
 				? cliOverrides.allowGpgAgent
 				: config.allowGpgAgent,
+		allowGitConfig:
+			cliOverrides.allowGitConfig !== undefined
+				? cliOverrides.allowGitConfig
+				: config.allowGitConfig,
 		allowXdgRuntime:
 			cliOverrides.allowXdgRuntime !== undefined
 				? cliOverrides.allowXdgRuntime
@@ -451,6 +485,7 @@ function showHelp() {
 Options:
   --allow-ssh-agent                       Allow access to SSH agent socket
   --allow-gpg-agent                       Allow access to GPG agent socket
+  --allow-git-config                      Allow access to user git configuration (read-only)
   --allow-xdg-runtime                     Allow full XDG runtime directory access
   -h, --help                              Show this help message
 
@@ -462,6 +497,7 @@ Configuration:
     {
       "allowSshAgent": false,
       "allowGpgAgent": false,
+      "allowGitConfig": false,
       "allowXdgRuntime": false
     }
 
@@ -473,6 +509,7 @@ Security:
 Examples:
   claudebox                               # Run with default settings
   claudebox --allow-ssh-agent             # Allow SSH agent for git operations
+  claudebox --allow-git-config            # Allow user git config for commits
   claudebox --allow-xdg-runtime           # Allow full XDG runtime access`);
 }
 
@@ -514,6 +551,14 @@ function main() {
 
 	fs.mkdirSync(claudeHome, { recursive: true });
 
+	// Create parent directories in isolated home for bind mounts
+	if (
+		options.allowGitConfig &&
+		isDirectory(path.join(home, ".config", "git"))
+	) {
+		fs.mkdirSync(path.join(claudeHome, ".config"), { recursive: true });
+	}
+
 	// Claude config directories
 	const claudeConfig = path.join(home, ".claude");
 	fs.mkdirSync(claudeConfig, { recursive: true });
@@ -553,6 +598,7 @@ function main() {
 			repoRoot,
 			allowSshAgent: options.allowSshAgent,
 			allowGpgAgent: options.allowGpgAgent,
+			allowGitConfig: options.allowGitConfig,
 			allowXdgRuntime: options.allowXdgRuntime,
 		});
 	} catch (err) {
