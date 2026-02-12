@@ -65,6 +65,8 @@ const CONFIG_DEFAULTS = {
 	allowXdgRuntime: false,
 };
 
+const SANDBOX_SSH_SOCK = "/tmp/ssh-agent.sock";
+
 function getConfigPath() {
 	const xdgConfig =
 		process.env.XDG_CONFIG_HOME || path.join(process.env.HOME, ".config");
@@ -118,6 +120,32 @@ class Sandbox {
 	spawn(script) {
 		const { cmd, args, env } = this.wrap(script);
 		return spawn(cmd, args, { stdio: "inherit", env });
+	}
+
+	/**
+	 * Print the sandbox command without executing it.
+	 * @param {string} script - The bash script to run
+	 */
+	dryRun(script) {
+		const { cmd, args, env } = this.wrap(script);
+		const diffEnv = {};
+		for (const [k, v] of Object.entries(env)) {
+			if (process.env[k] !== v) diffEnv[k] = v;
+		}
+		for (const k of Object.keys(process.env)) {
+			if (!(k in env)) diffEnv[k] = "(deleted)";
+		}
+		if (Object.keys(diffEnv).length > 0) {
+			console.log("# Environment changes:");
+			for (const [k, v] of Object.entries(diffEnv)) {
+				console.log(`#   ${k}=${v}`);
+			}
+		}
+		console.log(
+			[cmd, ...args]
+				.map((a) => (/[\s'"]/.test(a) ? `'${a.replace(/'/g, "'\\''")}'` : a))
+				.join(" \\\n  "),
+		);
 	}
 
 	/**
@@ -214,6 +242,29 @@ class BubblewrapSandbox extends Sandbox {
 			"--bind",
 			"/nix/var/nix/daemon-socket",
 			"/nix/var/nix/daemon-socket",
+		];
+
+		// Sanitize system ssh_config to remove Nix store Includes that fail
+		// ownership checks inside the user namespace. This --ro-bind must come
+		// after --ro-bind /nix so it partially overrides the Nix store mount.
+		const sshConfigPath = "/etc/ssh/ssh_config";
+		if (pathExists(sshConfigPath)) {
+			try {
+				const realSshConfig = fs.realpathSync(sshConfigPath);
+				const content = fs.readFileSync(realSshConfig, "utf8");
+				const sanitized = content.replace(
+					/^Include\s+\/nix\/store\/.*$/gm,
+					"",
+				);
+				const sanitizedPath = path.join(claudeHome, "ssh_config");
+				fs.writeFileSync(sanitizedPath, sanitized);
+				args.push("--ro-bind", sanitizedPath, realSshConfig);
+			} catch {
+				// Ignore errors sanitizing ssh_config
+			}
+		}
+
+		args.push(
 
 			// Isolated temp filesystem
 			"--tmpfs",
@@ -256,7 +307,7 @@ class BubblewrapSandbox extends Sandbox {
 			"--setenv",
 			"TMP",
 			"/tmp",
-		];
+		);
 
 		// Mount parent directory tree as read-only if needed
 		if (shareTree !== repoRoot) {
@@ -276,23 +327,27 @@ class BubblewrapSandbox extends Sandbox {
 				args.push("--ro-bind", xdgRuntimeDir, xdgRuntimeDir);
 				args.push("--setenv", "XDG_RUNTIME_DIR", xdgRuntimeDir);
 			}
-		} else {
-			// Selective socket access
-			if (allowSshAgent && process.env.SSH_AUTH_SOCK) {
-				const sock = process.env.SSH_AUTH_SOCK;
-				if (pathExists(sock)) {
-					args.push("--ro-bind", sock, sock);
-					args.push("--setenv", "SSH_AUTH_SOCK", sock);
-				}
-			}
-
-			if (allowGpgAgent) {
-				const gpgDir = path.join(xdgRuntimeDir, "gnupg");
-				if (isDirectory(gpgDir)) {
-					args.push("--ro-bind", gpgDir, gpgDir);
-				}
+		} else if (allowGpgAgent) {
+			const gpgDir = path.join(xdgRuntimeDir, "gnupg");
+			if (isDirectory(gpgDir)) {
+				args.push("--ro-bind", gpgDir, gpgDir);
 			}
 		}
+
+		// SSH agent socket (independent of XDG runtime).
+		// This --bind must come after --tmpfs /tmp so the socket overlays the tmpfs.
+		if (allowSshAgent && process.env.SSH_AUTH_SOCK) {
+			const sock = process.env.SSH_AUTH_SOCK;
+			if (pathExists(sock)) {
+				args.push("--bind", sock, SANDBOX_SSH_SOCK);
+				args.push("--setenv", "SSH_AUTH_SOCK", SANDBOX_SSH_SOCK);
+			}
+		}
+
+		// Remove SSH_AUTH_SOCK from inherited env to prevent leaking
+		// the host path into the sandbox. It is set via --setenv when needed.
+		const env = { ...process.env };
+		delete env.SSH_AUTH_SOCK;
 
 		// Add the script to execute
 		args.push("bash", "-c", script);
@@ -300,7 +355,7 @@ class BubblewrapSandbox extends Sandbox {
 		return {
 			cmd: "bwrap",
 			args,
-			env: process.env,
+			env,
 		};
 	}
 }
@@ -390,6 +445,7 @@ function parseArgs(args) {
 		allowSshAgent: undefined,
 		allowGpgAgent: undefined,
 		allowXdgRuntime: undefined,
+		dryRun: false,
 	};
 
 	let i = 0;
@@ -409,6 +465,11 @@ function parseArgs(args) {
 
 			case "--allow-xdg-runtime":
 				cliOverrides.allowXdgRuntime = true;
+				i++;
+				break;
+
+			case "--dry-run":
+				cliOverrides.dryRun = true;
 				i++;
 				break;
 
@@ -439,6 +500,7 @@ function parseArgs(args) {
 			cliOverrides.allowXdgRuntime !== undefined
 				? cliOverrides.allowXdgRuntime
 				: config.allowXdgRuntime,
+		dryRun: cliOverrides.dryRun,
 	};
 
 	return options;
@@ -452,6 +514,7 @@ Options:
   --allow-ssh-agent                       Allow access to SSH agent socket
   --allow-gpg-agent                       Allow access to GPG agent socket
   --allow-xdg-runtime                     Allow full XDG runtime directory access
+  --dry-run                               Print sandbox command without executing
   -h, --help                              Show this help message
 
 Configuration:
@@ -514,6 +577,50 @@ function main() {
 
 	fs.mkdirSync(claudeHome, { recursive: true });
 
+	// Copy SSH public keys and known_hosts into sandbox home
+	if (options.allowSshAgent) {
+		const sshDir = path.join(home, ".ssh");
+		if (isDirectory(sshDir)) {
+			const sandboxSshDir = path.join(claudeHome, ".ssh");
+			fs.mkdirSync(sandboxSshDir, { mode: 0o700 });
+			fs.mkdirSync(path.join(sandboxSshDir, "controlmaster"), {
+				mode: 0o700,
+			});
+
+			// Copy known_hosts
+			const knownHosts = path.join(sshDir, "known_hosts");
+			if (pathExists(knownHosts)) {
+				fs.copyFileSync(knownHosts, path.join(sandboxSshDir, "known_hosts"));
+			}
+
+			// Copy config with IdentityAgent rewritten to sandbox socket path
+			const configSrc = path.join(sshDir, "config");
+			if (pathExists(configSrc)) {
+				let configContent = fs.readFileSync(configSrc, "utf8");
+				configContent = configContent.replace(
+					/^(\s*IdentityAgent\s+).*$/gm,
+					`$1${SANDBOX_SSH_SOCK}`,
+				);
+				fs.writeFileSync(path.join(sandboxSshDir, "config"), configContent, {
+					mode: 0o600,
+				});
+			}
+
+			try {
+				for (const file of fs.readdirSync(sshDir)) {
+					if (file.endsWith(".pub")) {
+						fs.copyFileSync(
+							path.join(sshDir, file),
+							path.join(sandboxSshDir, file),
+						);
+					}
+				}
+			} catch {
+				// Ignore errors reading .ssh directory
+			}
+		}
+	}
+
 	// Claude config directories
 	const claudeConfig = path.join(home, ".claude");
 	fs.mkdirSync(claudeConfig, { recursive: true });
@@ -565,6 +672,12 @@ function main() {
 cd '${projectDir}'
 exec claude --dangerously-skip-permissions
 `;
+
+	if (options.dryRun) {
+		sandbox.dryRun(script);
+		cleanup();
+		process.exit(0);
+	}
 
 	const child = sandbox.spawn(script);
 	child.on("close", (code) => process.exit(code || 0));
