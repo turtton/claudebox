@@ -354,7 +354,7 @@ class BubblewrapSandbox extends Sandbox {
 		if (allowXdgRuntime) {
 			// Mount entire XDG runtime directory
 			if (isDirectory(xdgRuntimeDir)) {
-				args.push("--ro-bind", xdgRuntimeDir, xdgRuntimeDir);
+				args.push("--bind", xdgRuntimeDir, xdgRuntimeDir);
 				args.push("--setenv", "XDG_RUNTIME_DIR", xdgRuntimeDir);
 			}
 		} else {
@@ -370,8 +370,18 @@ class BubblewrapSandbox extends Sandbox {
 			if (allowGpgAgent) {
 				const gpgDir = path.join(xdgRuntimeDir, "gnupg");
 				if (isDirectory(gpgDir)) {
-					args.push("--ro-bind", gpgDir, gpgDir);
+					args.push("--bind", gpgDir, gpgDir);
 				}
+			}
+		}
+
+		// Mount host ~/.gnupg into sandbox regardless of XDG runtime setting.
+		// GPG needs access to keyrings and config in ~/.gnupg even when the
+		// socket directory is already available via allowXdgRuntime.
+		if (allowGpgAgent) {
+			const hostGnupgDir = path.join(home, ".gnupg");
+			if (isDirectory(hostGnupgDir)) {
+				args.push("--bind", hostGnupgDir, path.join(home, ".gnupg"));
 			}
 		}
 
@@ -688,6 +698,34 @@ function main() {
 	});
 
 	fs.mkdirSync(claudeHome, { recursive: true });
+
+	// Pre-launch GPG daemons so their sockets exist before entering sandbox.
+	// Inside the sandbox --unshare-all creates a new PID namespace, preventing
+	// GPG from auto-starting daemons like keyboxd on demand.
+	if (options.allowGpgAgent) {
+		try {
+			execSync("gpgconf --launch gpg-agent", { stdio: "ignore" });
+		} catch {
+			// Ignore launch errors
+		}
+		try {
+			execSync("gpgconf --launch keyboxd", { stdio: "ignore" });
+		} catch {
+			// Ignore launch errors – keyboxd may not be available on older GPG
+		}
+		try {
+			execSync("gpgconf --launch dirmngr", { stdio: "ignore" });
+		} catch {
+			// Ignore launch errors
+		}
+
+		// Create mount point for ~/.gnupg inside sandbox home so bwrap
+		// can overlay the host directory onto the isolated home.
+		const hostGnupgDir = path.join(home, ".gnupg");
+		if (isDirectory(hostGnupgDir)) {
+			fs.mkdirSync(path.join(claudeHome, ".gnupg"), { mode: 0o700 });
+		}
+	}
 
 	// Create parent directories in isolated home for bind mounts
 	if (
